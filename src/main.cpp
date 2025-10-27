@@ -674,20 +674,42 @@ int main()
                             }
                         }
                         
-                        // Marcadores de frecuencia (eje Y)
-                        float freqStep = specHeight / 5.0f;
-                        const char* freqLabels[] = {"60 Hz", "45 Hz", "30 Hz", "15 Hz", "0 Hz"};
+                        // Marcadores de bandas cerebrales (eje Y) - De arriba (Gamma) a abajo (Delta)
+                        struct BandMarker {
+                            const char* label;
+                            float freqCenter; // Frecuencia central de la banda
+                            ImVec4 color;
+                        };
+                        
+                        const BandMarker bandMarkers[] = {
+                            {"Gamma (30-60 Hz)", 45.0f, ImVec4(1.0f, 0.0f, 0.5f, 1.0f)},  // Magenta
+                            {"Beta (13-30 Hz)", 21.5f, ImVec4(1.0f, 0.5f, 0.0f, 1.0f)},   // Naranja
+                            {"Alpha (8-13 Hz)", 10.5f, ImVec4(1.0f, 1.0f, 0.0f, 1.0f)},   // Amarillo
+                            {"Theta (4-8 Hz)", 6.0f, ImVec4(0.0f, 1.0f, 0.0f, 1.0f)},     // Verde
+                            {"Delta (<4 Hz)", 2.0f, ImVec4(0.0f, 0.5f, 1.0f, 1.0f)}       // Azul
+                        };
+                        
+                        float maxFreq = 60.0f; // Frecuencia máxima
+                        
                         for (int i = 0; i < 5; ++i) {
-                            ImVec2 labelPos = ImVec2(spec_min.x + 5, spec_min.y + i * freqStep);
-                            ImGui::GetWindowDrawList()->AddText(labelPos, 
-                                ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.8f)), 
-                                freqLabels[i]);
+                            // Calcular posición Y basada en la frecuencia (invertida: arriba = alta frecuencia)
+                            float normalizedFreq = bandMarkers[i].freqCenter / maxFreq;
+                            float yPos = spec_min.y + (1.0f - normalizedFreq) * specHeight;
                             
-                            // Línea guía sutil
-                            ImVec2 lineStart = ImVec2(spec_min.x, labelPos.y);
-                            ImVec2 lineEnd = ImVec2(spec_min.x + specWidth, labelPos.y);
+                            ImVec2 labelPos = ImVec2(spec_min.x + 5, yPos - 8);
+                            
+                            // Dibujar etiqueta con color de la banda
+                            ImGui::GetWindowDrawList()->AddText(labelPos, 
+                                ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.9f)), 
+                                bandMarkers[i].label);
+                            
+                            // Línea guía con color de la banda (más sutil)
+                            ImVec2 lineStart = ImVec2(spec_min.x, yPos);
+                            ImVec2 lineEnd = ImVec2(spec_min.x + specWidth, yPos);
+                            ImVec4 lineColor = bandMarkers[i].color;
+                            lineColor.w = 0.2f; // Transparencia
                             ImGui::GetWindowDrawList()->AddLine(lineStart, lineEnd, 
-                                ImGui::GetColorU32(ImVec4(0.3f, 0.3f, 0.3f, 0.3f)));
+                                ImGui::GetColorU32(lineColor), 1.5f);
                         }
                         
                         // Etiqueta de tiempo
