@@ -38,9 +38,12 @@ const int PLOT_BUFFER_SIZE = 1024;
 const int ENERGY_HISTORY_SIZE = 300;
 const int DWT_COEFFICIENTS_TO_SHOW = 512;
 
-// NUEVO: Control de velocidad del espectrograma
-const int SPECTROGRAM_UPDATE_INTERVAL = 10; // Actualizar cada 10 cálculos de DWT (más lento)
+// Control de velocidad del espectrograma
+const int SPECTROGRAM_UPDATE_INTERVAL = 10;
 std::atomic<int> g_spectrogramUpdateCounter(0);
+
+// NUEVO: Resolución del espectrograma (más bandas = más detalle)
+const int SPECTROGRAM_FREQ_BANDS = 64; // Resolución vertical (64 bandas de frecuencia)
 
 // Estructura para definir las bandas cerebrales (EEG)
 struct BrainwaveBand {
@@ -67,13 +70,109 @@ std::mutex g_dataMutex;
 std::atomic<bool> g_keepRunning = true;
 std::atomic<double> g_sampleFreq = 0.0;
 
-// NUEVO: Cache de último DWT calculado para evitar recalcular
+// Cache de último DWT calculado
 std::vector<std::vector<float>> g_lastDwtCoeffs(NUM_CHANNELS);
 std::vector<std::vector<float>> g_lastBandEnergies(NUM_CHANNELS);
 std::vector<bool> g_dwtNeedsUpdate(NUM_CHANNELS, true);
 
 struct PlotRange { float min; float max; };
 PlotRange g_sharedDwtPlotRange = {-512.0f, 512.0f};
+
+// -----------------------------------------------
+// NUEVO: Funciones de Suavizado e Interpolación
+// -----------------------------------------------
+
+// Interpolación bilineal para suavizar el espectrograma
+float bilinearInterpolate(float q11, float q12, float q21, float q22, float tx, float ty) {
+    float r1 = q11 * (1.0f - tx) + q21 * tx;
+    float r2 = q12 * (1.0f - tx) + q22 * tx;
+    return r1 * (1.0f - ty) + r2 * ty;
+}
+
+// Función de suavizado gaussiano simple para el historial
+std::vector<std::vector<float>> smoothSpectrogramData(const std::vector<std::vector<float>>& data) {
+    if (data.empty() || data[0].empty()) return data;
+    
+    std::vector<std::vector<float>> smoothed = data;
+    const int timeSize = data.size();
+    const int freqSize = data[0].size();
+    
+    // Kernel gaussiano simple 3x3
+    const float kernel[3][3] = {
+        {0.077847f, 0.123317f, 0.077847f},
+        {0.123317f, 0.195346f, 0.123317f},
+        {0.077847f, 0.123317f, 0.077847f}
+    };
+    
+    for (int t = 1; t < timeSize - 1; ++t) {
+        for (int f = 1; f < freqSize - 1; ++f) {
+            float sum = 0.0f;
+            for (int kt = -1; kt <= 1; ++kt) {
+                for (int kf = -1; kf <= 1; ++kf) {
+                    sum += data[t + kt][f + kf] * kernel[kt + 1][kf + 1];
+                }
+            }
+            smoothed[t][f] = sum;
+        }
+    }
+    
+    return smoothed;
+}
+
+// Mapeo de color estilo espectrograma (azul -> verde -> amarillo -> rojo)
+ImVec4 getSpectrogramColor(float intensity) {
+    // Clamp intensity to [0, 1]
+    intensity = std::max(0.0f, std::min(1.0f, intensity));
+    
+    // Color mapping: Dark Blue -> Cyan -> Green -> Yellow -> Red
+    ImVec4 color;
+    
+    if (intensity < 0.25f) {
+        // Dark Blue to Cyan
+        float t = intensity / 0.25f;
+        color = ImVec4(0.0f, t * 0.5f, 0.5f + t * 0.5f, 1.0f);
+    }
+    else if (intensity < 0.5f) {
+        // Cyan to Green
+        float t = (intensity - 0.25f) / 0.25f;
+        color = ImVec4(0.0f, 0.5f + t * 0.5f, 1.0f - t * 0.5f, 1.0f);
+    }
+    else if (intensity < 0.75f) {
+        // Green to Yellow
+        float t = (intensity - 0.5f) / 0.25f;
+        color = ImVec4(t, 1.0f, 0.5f - t * 0.5f, 1.0f);
+    }
+    else {
+        // Yellow to Red
+        float t = (intensity - 0.75f) / 0.25f;
+        color = ImVec4(1.0f, 1.0f - t * 0.5f, 0.0f, 1.0f);
+    }
+    
+    return color;
+}
+
+// Convertir coeficientes DWT a bandas de frecuencia de alta resolución
+std::vector<float> computeHighResBands(const std::vector<float>& dwtCoeffs, int numBands) {
+    std::vector<float> highResBands(numBands, 0.0f);
+    if (dwtCoeffs.empty()) return highResBands;
+    
+    int dwtSize = std::min((int)dwtCoeffs.size(), DWT_COEFFICIENTS_TO_SHOW);
+    
+    // Mapear coeficientes DWT a bandas de alta resolución con interpolación
+    for (int i = 0; i < numBands; ++i) {
+        float dwtPos = (float)i / numBands * dwtSize;
+        int idx1 = (int)dwtPos;
+        int idx2 = std::min(idx1 + 1, dwtSize - 1);
+        float frac = dwtPos - idx1;
+        
+        // Interpolación lineal entre coeficientes adyacentes
+        float val1 = std::abs(dwtCoeffs[idx1]);
+        float val2 = std::abs(dwtCoeffs[idx2]);
+        highResBands[i] = val1 * (1.0f - frac) + val2 * frac;
+    }
+    
+    return highResBands;
+}
 
 // -----------------------------------------------
 // Decodifica un frame binario
@@ -234,7 +333,7 @@ std::vector<float> calculate_band_energy(const std::vector<float>& dwtCoeffs) {
 }
 
 // -----------------------------------------------
-// Función del Hilo Lector (OPTIMIZADA)
+// Función del Hilo Lector
 // -----------------------------------------------
 void readSpikeShield_thread(const std::string& port)
 {
@@ -273,27 +372,24 @@ void readSpikeShield_thread(const std::string& port)
                                 g_channelData[i].pop_front();
                             }
 
-                            // OPTIMIZACIÓN: Solo calcular DWT cuando tenemos buffer completo
-                            // y marcar que necesita actualización
                             if (g_channelData[i].size() == PLOT_BUFFER_SIZE) {
                                 g_dwtNeedsUpdate[i] = true;
                                 
-                                // NUEVO: Solo actualizar espectrograma cada N muestras
                                 int counter = g_spectrogramUpdateCounter.fetch_add(1);
                                 if (counter % SPECTROGRAM_UPDATE_INTERVAL == 0) {
                                     std::vector<float> recentData(g_channelData[i].begin(), g_channelData[i].end());
                                     
                                     std::vector<float> dwtCoeffs = compute_haart_dwt(recentData);
-                                    std::vector<float> bandEnergies = calculate_band_energy(dwtCoeffs);
+                                    std::vector<float> highResBands = computeHighResBands(dwtCoeffs, SPECTROGRAM_FREQ_BANDS);
 
-                                    if (!bandEnergies.empty()) {
-                                        g_bandEnergyHistory[i].push_back(bandEnergies);
+                                    if (!highResBands.empty()) {
+                                        g_bandEnergyHistory[i].push_back(highResBands);
                                         if (g_bandEnergyHistory[i].size() > ENERGY_HISTORY_SIZE) {
                                             g_bandEnergyHistory[i].pop_front();
                                         }
                                     }
                                     
-                                    // Guardar cache del último DWT
+                                    std::vector<float> bandEnergies = calculate_band_energy(dwtCoeffs);
                                     g_lastDwtCoeffs[i] = dwtCoeffs;
                                     g_lastBandEnergies[i] = bandEnergies;
                                 }
@@ -336,7 +432,7 @@ static void glfw_error_callback(int error, const char* description)
 }
 
 // -----------------------------------------------
-// main (Hilo Principal / GUI) - OPTIMIZADO
+// main (Hilo Principal / GUI)
 // -----------------------------------------------
 int main()
 {
@@ -382,13 +478,11 @@ int main()
 #endif
     std::thread serialThread(readSpikeShield_thread, portName);
 
-    // NUEVO: Limitar FPS para reducir carga de CPU
     auto lastFrameTime = std::chrono::high_resolution_clock::now();
-    const double targetFrameTime = 1.0 / 30.0; // 30 FPS
+    const double targetFrameTime = 1.0 / 30.0;
 
     while (!glfwWindowShouldClose(window) && g_keepRunning)
     {
-        // OPTIMIZACIÓN: Control de frame rate
         auto now = std::chrono::high_resolution_clock::now();
         double deltaTime = std::chrono::duration<double>(now - lastFrameTime).count();
         
@@ -417,15 +511,14 @@ int main()
 
             ImGui::Text("Puerto: %s", portName.c_str());
             ImGui::SameLine();
-            ImGui::Text(" | Frecuencia de Muestreo (Fs): %.1f Hz", g_sampleFreq.load());
+            ImGui::Text(" | Fs: %.1f Hz", g_sampleFreq.load());
             ImGui::SameLine();
-            ImGui::Text(" | Espectrograma: 1 frame cada %d muestras", SPECTROGRAM_UPDATE_INTERVAL);
+            ImGui::Text(" | Espectrograma: %d bandas de frecuencia", SPECTROGRAM_FREQ_BANDS);
             ImGui::Separator();
 
             ImGui::DragFloatRange2("Zoom Y (DWT Global)", &g_sharedDwtPlotRange.min, &g_sharedDwtPlotRange.max, 1.0f, -4096.0f, 4096.0f);
             ImGui::Separator();
 
-            // OPTIMIZACIÓN: Copiar solo lo necesario con lock mínimo
             std::vector<std::vector<float>> plotData(NUM_CHANNELS);
             std::vector<std::vector<std::vector<float>>> energyHistory(NUM_CHANNELS);
             std::vector<bool> needsUpdate(NUM_CHANNELS);
@@ -462,7 +555,6 @@ int main()
 
                 ImGui::Text("Canal %d - Coeficientes Haar DWT (N=%d)", i + 1, PLOT_BUFFER_SIZE);
 
-                // OPTIMIZACIÓN: Usar cache si no hay actualización pendiente
                 std::vector<float> waveletCoeffs;
                 std::vector<float> bandEnergies;
                 
@@ -514,72 +606,131 @@ int main()
                 
                 ImGui::Dummy(ImVec2(contentWidth, SPACER_HEIGHT));
 
-                // Espectrograma solo para canal 1
+                // NUEVO: Espectrograma mejorado tipo FL Studio (solo canal 1)
                 if (i == 0) {
                     ImGui::Separator();
-                    ImGui::Text("Canal %d: Espectrograma de Energía de Banda (Tiempo vs Frecuencia) - %d Frames", i + 1, ENERGY_HISTORY_SIZE);
+                    ImGui::Text("Canal %d: Espectrograma de Alta Resolución (Tiempo vs Frecuencia)", i + 1);
                     
-                    if (energyHistory[i].size() > 1) {
+                    if (energyHistory[i].size() > 5) {
                         ImGui::BeginChild("Spectrogram_Child", ImVec2(contentWidth, spectrogramHeight), true, ImGuiWindowFlags_NoScrollbar);
                         
                         float specWidth = ImGui::GetContentRegionAvail().x;
                         float specHeight = ImGui::GetContentRegionAvail().y;
 
-                        float cellWidth = specWidth / ENERGY_HISTORY_SIZE;
-                        float cellHeight = specHeight / g_bands.size();
-                        
                         ImVec2 spec_min = ImGui::GetCursorScreenPos();
-                        ImVec2 spec_max = ImVec2(spec_min.x + specWidth, spec_min.y + specHeight);
                         
-                        // Normalización
-                        float maxTotalEnergy = 1.0f;
-                        for(const auto& frameEnergy : energyHistory[i]) {
-                             for (float energy : frameEnergy) {
-                                maxTotalEnergy = std::max(maxTotalEnergy, energy);
-                             }
-                        }
-
-                        ImGui::GetWindowDrawList()->AddRectFilled(spec_min, spec_max, ImGui::GetColorU32(ImVec4(0.1f, 0.1f, 0.1f, 1.0f)));
+                        // Suavizar datos antes de renderizar
+                        std::vector<std::vector<float>> smoothedData = smoothSpectrogramData(energyHistory[i]);
                         
-                        for (size_t k = 0; k < g_bands.size(); ++k) {
-                            const auto& band = g_bands[g_bands.size() - 1 - k];
-                            
-                            ImVec2 label_pos = ImVec2(spec_min.x + 5, spec_min.y + (k * cellHeight) + (cellHeight/3));
-                            ImGui::GetWindowDrawList()->AddText(label_pos, ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 1.0f)), band.name.c_str());
-
-                            ImVec2 line_start = ImVec2(spec_min.x, spec_min.y + k * cellHeight);
-                            ImVec2 line_end = ImVec2(spec_max.x, spec_min.y + k * cellHeight);
-                            ImGui::GetWindowDrawList()->AddLine(line_start, line_end, ImGui::GetColorU32(ImVec4(0.3f, 0.3f, 0.3f, 1.0f)));
-
-                            for (size_t t = 0; t < energyHistory[i].size(); ++t) {
-                                const auto& frameEnergy = energyHistory[i][t];
-                                size_t bandIdx = g_bands.size() - 1 - k; 
-                                
-                                if (bandIdx < frameEnergy.size()) {
-                                    float energyNormalized = std::min(frameEnergy[bandIdx] / maxTotalEnergy, 1.0f);
-
-                                    ImVec4 heatColor = band.color;
-                                    ImVec4 finalColor = ImVec4(
-                                        heatColor.x * energyNormalized * 0.8f,
-                                        heatColor.y * energyNormalized * 0.8f,
-                                        heatColor.z * energyNormalized * 0.8f,
-                                        1.0f
-                                    );
-                                    
-                                    ImVec2 cellA = ImVec2(spec_min.x + t * cellWidth, spec_min.y + k * cellHeight);
-                                    ImVec2 cellB = ImVec2(spec_min.x + (t + 1) * cellWidth, spec_min.y + (k + 1) * cellHeight);
-
-                                    ImGui::GetWindowDrawList()->AddRectFilled(cellA, cellB, ImGui::GetColorU32(finalColor));
-                                }
+                        // Normalización adaptativa
+                        float maxEnergy = 1.0f;
+                        for(const auto& frameEnergy : smoothedData) {
+                            for (float energy : frameEnergy) {
+                                maxEnergy = std::max(maxEnergy, energy);
                             }
                         }
-
-                        ImGui::SetCursorScreenPos(ImVec2(spec_min.x + specWidth - 100, spec_max.y + 5));
-                        ImGui::Text("Tiempo reciente ->");
+                        
+                        // Renderizar con interpolación bilineal
+                        int timeSteps = smoothedData.size();
+                        int freqBands = SPECTROGRAM_FREQ_BANDS;
+                        
+                        float pixelsPerTime = specWidth / timeSteps;
+                        float pixelsPerFreq = specHeight / freqBands;
+                        
+                        // Dibujar píxeles interpolados (efecto de manchas suaves)
+                        for (int px = 0; px < (int)specWidth; px += 2) {
+                            for (int py = 0; py < (int)specHeight; py += 2) {
+                                // Mapear posición de píxel a coordenadas de datos
+                                float t = (float)px / specWidth * (timeSteps - 1);
+                                float f = (float)py / specHeight * (freqBands - 1);
+                                
+                                int t1 = (int)t;
+                                int t2 = std::min(t1 + 1, timeSteps - 1);
+                                int f1 = (int)f;
+                                int f2 = std::min(f1 + 1, freqBands - 1);
+                                
+                                float tx = t - t1;
+                                float ty = f - f1;
+                                
+                                // Interpolación bilineal
+                                float val = bilinearInterpolate(
+                                    smoothedData[t1][f1],
+                                    smoothedData[t1][f2],
+                                    smoothedData[t2][f1],
+                                    smoothedData[t2][f2],
+                                    tx, ty
+                                );
+                                
+                                // Normalizar y aplicar mapeo de color
+                                float intensity = val / maxEnergy;
+                                intensity = std::pow(intensity, 0.7f); // Ajuste gamma para mejor contraste
+                                
+                                ImVec4 color = getSpectrogramColor(intensity);
+                                
+                                // Dibujar rectángulo de 2x2 píxeles para suavidad
+                                ImVec2 p1 = ImVec2(spec_min.x + px, spec_min.y + py);
+                                ImVec2 p2 = ImVec2(spec_min.x + px + 2, spec_min.y + py + 2);
+                                ImGui::GetWindowDrawList()->AddRectFilled(p1, p2, ImGui::GetColorU32(color));
+                            }
+                        }
+                        
+                        // Marcadores de frecuencia (eje Y)
+                        float freqStep = specHeight / 5.0f;
+                        const char* freqLabels[] = {"60 Hz", "45 Hz", "30 Hz", "15 Hz", "0 Hz"};
+                        for (int i = 0; i < 5; ++i) {
+                            ImVec2 labelPos = ImVec2(spec_min.x + 5, spec_min.y + i * freqStep);
+                            ImGui::GetWindowDrawList()->AddText(labelPos, 
+                                ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.8f)), 
+                                freqLabels[i]);
+                            
+                            // Línea guía sutil
+                            ImVec2 lineStart = ImVec2(spec_min.x, labelPos.y);
+                            ImVec2 lineEnd = ImVec2(spec_min.x + specWidth, labelPos.y);
+                            ImGui::GetWindowDrawList()->AddLine(lineStart, lineEnd, 
+                                ImGui::GetColorU32(ImVec4(0.3f, 0.3f, 0.3f, 0.3f)));
+                        }
+                        
+                        // Etiqueta de tiempo
+                        ImVec2 timeLabelPos = ImVec2(spec_min.x + specWidth - 120, spec_min.y + specHeight - 20);
+                        ImGui::GetWindowDrawList()->AddText(timeLabelPos, 
+                            ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.8f)), 
+                            "Tiempo reciente ->");
+                        
+                        // Barra de escala de color (leyenda)
+                        float legendX = spec_min.x + specWidth - 30;
+                        float legendY = spec_min.y + 40;
+                        float legendHeight = specHeight - 80;
+                        
+                        for (int i = 0; i < 50; ++i) {
+                            float intensity = (float)i / 50.0f;
+                            ImVec4 color = getSpectrogramColor(intensity);
+                            ImVec2 p1 = ImVec2(legendX, legendY + (49 - i) * (legendHeight / 50));
+                            ImVec2 p2 = ImVec2(legendX + 15, p1.y + (legendHeight / 50) + 1);
+                            ImGui::GetWindowDrawList()->AddRectFilled(p1, p2, ImGui::GetColorU32(color));
+                        }
+                        
+                        // Bordes de la leyenda
+                        ImGui::GetWindowDrawList()->AddRect(
+                            ImVec2(legendX, legendY), 
+                            ImVec2(legendX + 15, legendY + legendHeight),
+                            ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.5f))
+                        );
+                        
+                        // Etiquetas de intensidad
+                        ImGui::GetWindowDrawList()->AddText(
+                            ImVec2(legendX - 35, legendY - 5), 
+                            ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.8f)), 
+                            "Max"
+                        );
+                        ImGui::GetWindowDrawList()->AddText(
+                            ImVec2(legendX - 35, legendY + legendHeight - 10), 
+                            ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.8f)), 
+                            "Min"
+                        );
 
                         ImGui::EndChild();
                     } else {
-                        ImGui::Text("Calculando energía de bandas...");
+                        ImGui::Text("Acumulando datos para el espectrograma...");
                         ImGui::Dummy(ImVec2(contentWidth, spectrogramHeight));
                     }
                 }
